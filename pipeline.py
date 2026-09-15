@@ -13,8 +13,6 @@ SPEAKER_COLORS = ["#6B8AFF", "#F5A623", "#4CAF50", "#E91E63", "#9C27B0", "#00BCD
 
 
 def extract_audio_from_video(video_path: str, audio_output_path: str):
-    """Extrai o áudio do vídeo convertendo para WAV 16kHz Mono."""
-    print("🎬 Extraindo áudio do vídeo...")
     command = [
         "ffmpeg",
         "-y",
@@ -37,55 +35,71 @@ def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
     if len(block_audio) == 0:
         return "dialogue"
 
-    # 1. Spectral Flatness (Planura Espectral - ruídos e SFX possuem alta planura)
-    flatness = float(np.mean(librosa.feature.spectral_flatness(y=block_audio)))
+    total_energy = float(np.mean(block_audio**2))
+    
+    # Proteção contra silêncio / piso de ruído
+    if total_energy < 1e-4:
+        return "dialogue"
 
-    # 2. Zero Crossing Rate (Taxa de Cruzamento por Zero - alta em ruídos e cliques)
+    flatness = float(np.mean(librosa.feature.spectral_flatness(y=block_audio)))
     zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=block_audio)))
 
-    # 3. Análise Harmônica vs Percussiva (Música costuma ter forte componente harmônico contínuo)
     y_harmonic = librosa.effects.harmonic(block_audio)
     harmonic_energy = float(np.mean(y_harmonic**2))
-    total_energy = float(np.mean(block_audio**2)) + 1e-6
-    harmonic_ratio = harmonic_energy / total_energy
+    harmonic_ratio = harmonic_energy / (total_energy + 1e-6)
 
-    # Regras de classificação baseadas na física do áudio
-    if flatness > 0.22 or zcr > 0.20:
+    if flatness > 0.25 or zcr > 0.22:
         return "sfx"
-    elif harmonic_ratio > 0.65 and flatness < 0.08:
+    elif harmonic_ratio > 0.70 and flatness < 0.06:
         return "music"
     else:
         return "dialogue"
 
 
-def calculate_word_metrics(word_audio: np.ndarray, sr: int, max_rms: float) -> dict:
-    """Calcula volume relativo e weight baseado no pico global de áudio do vídeo."""
+def calculate_word_metrics(
+    word_audio: np.ndarray, global_mean_db: float, global_max_db: float
+) -> dict:
+    """Calcula weight e volumePercent em escala contínua com trava anti-sussurro falso."""
     if len(word_audio) == 0:
-        return {"volumePercent": 50, "weight": 600, "width": 78, "italic": False}
+        return {"volumePercent": 50, "weight": 550, "width": 78, "italic": False}
 
-    # 1. Energia RMS da palavra
-    rms = float(np.sqrt(np.mean(word_audio**2)))
+    # 1. Converte o RMS da palavra atual para Decibéis (dBFS)
+    word_rms = float(np.sqrt(np.mean(word_audio**2)))
+    word_db = 20 * np.log10(max(word_rms, 1e-6))
 
-    # 2. Volume relativo normalizado de 0% a 100%
-    volume_percent = int(min(1.0, (rms / max_rms)) * 100)
-
-    # 3. Mapeamento de Font Weight pelo volume
-    if volume_percent <= 20:
-        weight = 300  # Sussurro (fonte leve/fina)
-    elif volume_percent <= 45:
-        weight = 400  # Fala suave
-    elif volume_percent <= 75:
-        weight = 600  # Fala normal / padrão firme
-    elif volume_percent <= 88:
-        weight = 800  # Destaque
+    # 2. Trava de segurança no piso com base no volume geral do áudio
+    if global_mean_db > -14.0:
+        min_weight = 550
+    elif global_mean_db > -20.0:
+        min_weight = 400
     else:
-        weight = 900  # Grito / Ênfase máxima
+        min_weight = 300
+
+    max_weight = 900
+
+    # 3. Interpolação contínua (Rampa Matemática em vez de IFs fixos)
+    min_db_bound = global_mean_db - 12.0
+    
+    raw_weight = np.interp(
+        word_db, 
+        [min_db_bound, global_max_db], 
+        [min_weight, max_weight]
+    )
+
+    # Arredonda para múltiplos de 50 (ex: 400, 450, 500, 550... 900)
+    weight = int(round(raw_weight / 50.0) * 50)
+    weight = int(np.clip(weight, min_weight, max_weight))
+
+    # 4. Porcentagem de volume relativa
+    volume_percent = int(
+        np.clip((word_db - min_db_bound) / (global_max_db - min_db_bound + 1e-6) * 100, 0, 100)
+    )
 
     return {
         "volumePercent": volume_percent,
         "weight": weight,
         "width": 78,
-        "italic": False,  # Mantido sempre False
+        "italic": False,
     }
 
 
@@ -102,12 +116,23 @@ def process_video_to_json(
         # 1. Extração de Áudio
         extract_audio_from_video(video_path, temp_audio)
 
-        # 2. Leitura com Librosa para análise de sinal
+        # 2. Leitura e Normalização do Sinal com Librosa
         y, sr = librosa.load(temp_audio, sr=16000)
         total_duration = float(librosa.get_duration(y=y, sr=sr))
 
-        rms_all = librosa.feature.rms(y=y)[0]
-        max_rms = float(np.percentile(rms_all, 95)) + 1e-6
+        # Remoção de deslocamento DC
+        y = y - np.mean(y)
+
+        # Normalização de Pico (-1 dBFS / ~0.90 amplitude)
+        y = librosa.util.normalize(y, norm=np.inf) * 0.90
+
+        # Análise de Decibéis Perceptivos (dBFS)
+        rms_frames = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+        active_rms = rms_frames[rms_frames > np.percentile(rms_frames, 20)]
+        
+        db_speech = 20 * np.log10(np.maximum(active_rms, 1e-6))
+        global_mean_db = float(np.median(db_speech)) if len(db_speech) > 0 else -20.0
+        global_max_db = float(np.percentile(db_speech, 98)) if len(db_speech) > 0 else -1.0
 
         # 3. Transcrição e Alinhamento Preciso de Palavras com WhisperX
         whisper_model = whisperx.load_model(
@@ -138,7 +163,6 @@ def process_video_to_json(
             if not words:
                 continue
 
-            # Identificação do Falante (Usa a chave de diarização se existir, senão usa S0)
             speaker_id = segment.get("speaker")
             if not speaker_id:
                 speaker_id = f"S{speaker_counter}"
@@ -151,7 +175,6 @@ def process_video_to_json(
             block_start = round(words[0]["start"], 2)
             block_end = round(words[-1]["end"], 2)
 
-            # Recorte do áudio do bloco para classificação (dialogue / music / sfx)
             start_sample_block = int(block_start * sr)
             end_sample_block = int(block_end * sr)
             block_type = classify_block_type(y[start_sample_block:end_sample_block], sr)
@@ -164,12 +187,12 @@ def process_video_to_json(
                 w_start = round(w["start"], 2)
                 w_end = round(w["end"], 2)
 
-                # Amostra do áudio da palavra individual
                 start_sample_word = int(w_start * sr)
                 end_sample_word = int(w_end * sr)
                 word_audio = y[start_sample_word:end_sample_word]
 
-                metrics = calculate_word_metrics(word_audio, sr, max_rms)
+                # Chamada com a rampa contínua e filtro de dBFS global
+                metrics = calculate_word_metrics(word_audio, global_mean_db, global_max_db)
 
                 words_data.append(
                     {
@@ -195,7 +218,7 @@ def process_video_to_json(
                     }
                 )
 
-        # 5. Criação do Elenco (Cast)
+        # 5. Criação do elenco
         cast = []
         for idx, spk in enumerate(speaker_map.values()):
             cast.append(
@@ -213,7 +236,6 @@ def process_video_to_json(
             "metadata": {
                 "duration": round(total_duration, 1),
                 "language": language,
-                # CORREÇÃO: Uso de datetime.now(timezone.utc)
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "generator": "opencaptions/0.1.0",
                 "extractor_backend": "audio-vision-v1",
@@ -222,12 +244,10 @@ def process_video_to_json(
             "captions": captions,
         }
 
-        # Salva o arquivo JSON
         with open(output_json_path, "w", encoding="utf-8") as f:
             json.dump(final_json, f, ensure_ascii=False, indent=2)
 
     finally:
-        # Limpa o áudio temporário extraído
         if os.path.exists(temp_audio):
             os.remove(temp_audio)
 
