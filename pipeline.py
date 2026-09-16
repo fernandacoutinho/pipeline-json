@@ -8,9 +8,7 @@ import numpy as np
 import torch
 import whisperx
 
-# Cores atribuídas automaticamente aos falantes no elenco (cast)
 SPEAKER_COLORS = ["#6B8AFF", "#F5A623", "#4CAF50", "#E91E63", "#9C27B0", "#00BCD4"]
-
 
 def extract_audio_from_video(video_path: str, audio_output_path: str):
     command = [
@@ -29,15 +27,12 @@ def extract_audio_from_video(video_path: str, audio_output_path: str):
     ]
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-
 def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
-    """Classifica um bloco de áudio entre 'dialogue', 'music' e 'sfx' usando análise acústica."""
+    """Classifica o bloco entre 'dialogue', 'music' e 'sfx'."""
     if len(block_audio) == 0:
         return "dialogue"
 
     total_energy = float(np.mean(block_audio**2))
-    
-    # Proteção contra silêncio / piso de ruído
     if total_energy < 1e-4:
         return "dialogue"
 
@@ -55,53 +50,19 @@ def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
     else:
         return "dialogue"
 
-
-def calculate_word_metrics(
-    word_audio: np.ndarray, global_mean_db: float, global_max_db: float
-) -> dict:
-    """Calcula weight e volumePercent em escala contínua com trava anti-sussurro falso."""
+def get_word_db(word_audio: np.ndarray) -> float:
+    """Calcula o nível de energia em dB da palavra."""
     if len(word_audio) == 0:
-        return {"volumePercent": 50, "weight": 550, "width": 78, "italic": False}
+        return -60.0
 
-    # 1. Converte o RMS da palavra atual para Decibéis (dBFS)
-    word_rms = float(np.sqrt(np.mean(word_audio**2)))
-    word_db = 20 * np.log10(max(word_rms, 1e-6))
-
-    # 2. Trava de segurança no piso com base no volume geral do áudio
-    if global_mean_db > -14.0:
-        min_weight = 550
-    elif global_mean_db > -20.0:
-        min_weight = 400
+    frame_length = min(len(word_audio), 256)
+    if frame_length < 64:
+        rms = float(np.sqrt(np.mean(word_audio**2)))
     else:
-        min_weight = 300
+        rms_frames = librosa.feature.rms(y=word_audio, frame_length=frame_length, hop_length=64)[0]
+        rms = float(np.percentile(rms_frames, 80))
 
-    max_weight = 900
-
-    # 3. Interpolação contínua (Rampa Matemática em vez de IFs fixos)
-    min_db_bound = global_mean_db - 12.0
-    
-    raw_weight = np.interp(
-        word_db, 
-        [min_db_bound, global_max_db], 
-        [min_weight, max_weight]
-    )
-
-    # Arredonda para múltiplos de 50 (ex: 400, 450, 500, 550... 900)
-    weight = int(round(raw_weight / 50.0) * 50)
-    weight = int(np.clip(weight, min_weight, max_weight))
-
-    # 4. Porcentagem de volume relativa
-    volume_percent = int(
-        np.clip((word_db - min_db_bound) / (global_max_db - min_db_bound + 1e-6) * 100, 0, 100)
-    )
-
-    return {
-        "volumePercent": volume_percent,
-        "weight": weight,
-        "width": 78,
-        "italic": False,
-    }
-
+    return 20 * np.log10(max(rms, 1e-6))
 
 def process_video_to_json(
     video_path: str,
@@ -116,25 +77,20 @@ def process_video_to_json(
         # 1. Extração de Áudio
         extract_audio_from_video(video_path, temp_audio)
 
-        # 2. Leitura e Normalização do Sinal com Librosa
+        # 2. Leitura e Normalização do Áudio Completo
         y, sr = librosa.load(temp_audio, sr=16000)
         total_duration = float(librosa.get_duration(y=y, sr=sr))
 
-        # Remoção de deslocamento DC
         y = y - np.mean(y)
-
-        # Normalização de Pico (-1 dBFS / ~0.90 amplitude)
         y = librosa.util.normalize(y, norm=np.inf) * 0.90
 
-        # Análise de Decibéis Perceptivos (dBFS)
+        # Média Global de referência
         rms_frames = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
         active_rms = rms_frames[rms_frames > np.percentile(rms_frames, 20)]
-        
         db_speech = 20 * np.log10(np.maximum(active_rms, 1e-6))
         global_mean_db = float(np.median(db_speech)) if len(db_speech) > 0 else -20.0
-        global_max_db = float(np.percentile(db_speech, 98)) if len(db_speech) > 0 else -1.0
 
-        # 3. Transcrição e Alinhamento Preciso de Palavras com WhisperX
+        # 3. Transcrição e Alinhamento
         whisper_model = whisperx.load_model(
             model_size, device, compute_type="float32", language=language
         )
@@ -153,37 +109,43 @@ def process_video_to_json(
             return_char_alignments=False,
         )
 
-        # 4. Estruturação dos Blocos e Palavras
         captions = []
-        speaker_map = {}
-        speaker_counter = 0
+        mapped_speaker_id = "S0"
 
+        # 4. Processamento dos Blocos com Normalização Suave
         for seg_idx, segment in enumerate(aligned_result["segments"]):
             words = segment.get("words", [])
             if not words:
                 continue
-
-            speaker_id = segment.get("speaker")
-            if not speaker_id:
-                speaker_id = f"S{speaker_counter}"
-
-            if speaker_id not in speaker_map:
-                speaker_map[speaker_id] = f"S{len(speaker_map)}"
-
-            mapped_speaker_id = speaker_map[speaker_id]
 
             block_start = round(words[0]["start"], 2)
             block_end = round(words[-1]["end"], 2)
 
             start_sample_block = int(block_start * sr)
             end_sample_block = int(block_end * sr)
-            block_type = classify_block_type(y[start_sample_block:end_sample_block], sr)
+            block_audio = y[start_sample_block:end_sample_block]
 
-            words_data = []
+            block_type = classify_block_type(block_audio, sr)
+
+            # Média do bloco para o volumePercent
+            if len(block_audio) > 0:
+                block_rms_frames = librosa.feature.rms(y=block_audio, frame_length=1024, hop_length=256)[0]
+                active_block_rms = block_rms_frames[block_rms_frames > 1e-4]
+                block_mean_db = (
+                    float(np.median(20 * np.log10(active_block_rms)))
+                    if len(active_block_rms) > 0
+                    else global_mean_db
+                )
+            else:
+                block_mean_db = global_mean_db
+
+            # Pré-calcular dB de cada palavra para extrair estatísticas locais
+            block_words_info = []
+            words_db_list = []
+
             for w in words:
                 if "start" not in w or "end" not in w:
                     continue
-
                 w_start = round(w["start"], 2)
                 w_end = round(w["end"], 2)
 
@@ -191,45 +153,84 @@ def process_video_to_json(
                 end_sample_word = int(w_end * sr)
                 word_audio = y[start_sample_word:end_sample_word]
 
-                # Chamada com a rampa contínua e filtro de dBFS global
-                metrics = calculate_word_metrics(word_audio, global_mean_db, global_max_db)
+                w_db = get_word_db(word_audio)
+                words_db_list.append(w_db)
+                block_words_info.append({
+                    "word": w["word"].strip(),
+                    "start": w_start,
+                    "end": w_end,
+                    "db": w_db
+                })
+
+            if not block_words_info:
+                continue
+
+            # Estatísticas relativas do bloco
+            median_db = float(np.median(words_db_list))
+            max_db = float(np.max(words_db_list))
+            min_db = float(np.min(words_db_list))
+
+            # Mapeamento suave de volumePercent e weight
+            words_data = []
+            for item in block_words_info:
+                w_db = item["db"]
+
+                # A. Cálculo do volumePercent (escala moderada de 4x por dB)
+                delta_ref = (0.7 * (w_db - block_mean_db)) + (0.3 * (w_db - global_mean_db))
+                raw_vol = 50.0 + (delta_ref * 4.0)
+                volume_percent = int(np.clip(round(raw_vol), 20, 95))
+
+                # B. Normalização Suave da espessura com base na Mediana e Máximo
+                if max_db == min_db:
+                    weight = 400
+                elif w_db >= median_db:
+                    # Sobem da mediana (400) até o pico do bloco (700)
+                    headroom = max(max_db - median_db, 1.5)
+                    ratio = np.clip((w_db - median_db) / headroom, 0.0, 1.0)
+                    raw_weight = 400.0 + (ratio * 300.0)
+                    weight = int(round(raw_weight / 50.0) * 50)
+                else:
+                    # Caem da mediana (400) até o piso do bloco (300)
+                    floorroom = max(median_db - min_db, 1.5)
+                    ratio = np.clip((median_db - w_db) / floorroom, 0.0, 1.0)
+                    raw_weight = 400.0 - (ratio * 100.0)
+                    weight = int(round(raw_weight / 50.0) * 50)
+
+                weight = int(np.clip(weight, 300, 800))
 
                 words_data.append(
                     {
-                        "text": w["word"].strip(),
-                        "start": w_start,
-                        "end": w_end,
-                        "weight": metrics["weight"],
-                        "volumePercent": metrics["volumePercent"],
-                        "width": metrics["width"],
-                        "italic": metrics["italic"],
+                        "text": item["word"],
+                        "start": item["start"],
+                        "end": item["end"],
+                        "weight": weight,
+                        "volumePercent": volume_percent,
+                        "width": 78,
+                        "italic": False,
                     }
                 )
 
-            if words_data:
-                captions.append(
-                    {
-                        "id": f"block-{seg_idx + 1}-{block_type}-{mapped_speaker_id.lower()}",
-                        "start": block_start,
-                        "end": block_end,
-                        "speaker_id": mapped_speaker_id,
-                        "type": block_type,
-                        "words": words_data,
-                    }
-                )
-
-        # 5. Criação do elenco
-        cast = []
-        for idx, spk in enumerate(speaker_map.values()):
-            cast.append(
+            captions.append(
                 {
-                    "id": spk,
-                    "name": f"Speaker {idx}",
-                    "color": SPEAKER_COLORS[idx % len(SPEAKER_COLORS)],
+                    "id": f"block-{seg_idx + 1}-{block_type}-{mapped_speaker_id.lower()}",
+                    "start": block_start,
+                    "end": block_end,
+                    "speaker_id": mapped_speaker_id,
+                    "type": block_type,
+                    "words": words_data,
                 }
             )
 
-        # 6. Montagem do JSON final no Schema CWI 1.0
+        # 5. Elenco
+        cast = [
+            {
+                "id": "S0",
+                "name": "Speaker 0",
+                "color": SPEAKER_COLORS[0],
+            }
+        ]
+
+        # 6. JSON Final
         final_json = {
             "$schema": "https://opencaptions.tools/schema/cwi/1.0.json",
             "version": "1.0",
@@ -250,7 +251,6 @@ def process_video_to_json(
     finally:
         if os.path.exists(temp_audio):
             os.remove(temp_audio)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
