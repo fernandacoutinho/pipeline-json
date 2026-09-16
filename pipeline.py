@@ -74,23 +74,23 @@ def process_video_to_json(
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
-        # 1. Extração de Áudio
+        # 1. Extração de áudio
         extract_audio_from_video(video_path, temp_audio)
 
-        # 2. Leitura e Normalização do Áudio Completo
+        # 2. Leitura e normalização do áudio completo
         y, sr = librosa.load(temp_audio, sr=16000)
         total_duration = float(librosa.get_duration(y=y, sr=sr))
 
         y = y - np.mean(y)
         y = librosa.util.normalize(y, norm=np.inf) * 0.90
 
-        # Média Global de referência
+        # Média global de referência
         rms_frames = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
         active_rms = rms_frames[rms_frames > np.percentile(rms_frames, 20)]
         db_speech = 20 * np.log10(np.maximum(active_rms, 1e-6))
         global_mean_db = float(np.median(db_speech)) if len(db_speech) > 0 else -20.0
 
-        # 3. Transcrição e Alinhamento
+        # 3. Transcrição e alinhamento
         whisper_model = whisperx.load_model(
             model_size, device, compute_type="float32", language=language
         )
@@ -112,7 +112,7 @@ def process_video_to_json(
         captions = []
         mapped_speaker_id = "S0"
 
-        # 4. Processamento dos Blocos com Normalização Suave
+        # 4. Processamento dos blocos com separação de volume e energia de pronúncia
         for seg_idx, segment in enumerate(aligned_result["segments"]):
             words = segment.get("words", [])
             if not words:
@@ -127,22 +127,7 @@ def process_video_to_json(
 
             block_type = classify_block_type(block_audio, sr)
 
-            # Média do bloco para o volumePercent
-            if len(block_audio) > 0:
-                block_rms_frames = librosa.feature.rms(y=block_audio, frame_length=1024, hop_length=256)[0]
-                active_block_rms = block_rms_frames[block_rms_frames > 1e-4]
-                block_mean_db = (
-                    float(np.median(20 * np.log10(active_block_rms)))
-                    if len(active_block_rms) > 0
-                    else global_mean_db
-                )
-            else:
-                block_mean_db = global_mean_db
-
-            # Pré-calcular dB de cada palavra para extrair estatísticas locais
             block_words_info = []
-            words_db_list = []
-
             for w in words:
                 if "start" not in w or "end" not in w:
                     continue
@@ -154,49 +139,46 @@ def process_video_to_json(
                 word_audio = y[start_sample_word:end_sample_word]
 
                 w_db = get_word_db(word_audio)
-                words_db_list.append(w_db)
                 block_words_info.append({
                     "word": w["word"].strip(),
                     "start": w_start,
                     "end": w_end,
-                    "db": w_db
+                    "db": w_db,
+                    "audio": word_audio,
                 })
 
             if not block_words_info:
                 continue
 
-            # Estatísticas relativas do bloco
-            median_db = float(np.median(words_db_list))
-            max_db = float(np.max(words_db_list))
-            min_db = float(np.min(words_db_list))
-
-            # Mapeamento suave de volumePercent e weight
             words_data = []
             for item in block_words_info:
                 w_db = item["db"]
+                word_audio = item["audio"]
 
-                # A. Cálculo do volumePercent (escala moderada de 4x por dB)
-                delta_ref = (0.7 * (w_db - block_mean_db)) + (0.3 * (w_db - global_mean_db))
-                raw_vol = 50.0 + (delta_ref * 4.0)
-                volume_percent = int(np.clip(round(raw_vol), 20, 95))
+                # A. Volume relativo da palavra (volume_percent)
+                db_diff = w_db - global_mean_db
+                volume_percent = int(np.clip(50 + (db_diff * 3.5), 10, 100))
 
-                # B. Normalização Suave da espessura com base na Mediana e Máximo
-                if max_db == min_db:
-                    weight = 400
-                elif w_db >= median_db:
-                    # Sobem da mediana (400) até o pico do bloco (700)
-                    headroom = max(max_db - median_db, 1.5)
-                    ratio = np.clip((w_db - median_db) / headroom, 0.0, 1.0)
-                    raw_weight = 400.0 + (ratio * 300.0)
-                    weight = int(round(raw_weight / 50.0) * 50)
+                # B. Energia (espessura) da palavra (emphasis_score)
+                if len(word_audio) > 0:
+                    peak_rms = float(np.max(np.abs(word_audio)))
+                    spectral_centroid = float(np.mean(librosa.feature.spectral_centroid(y=word_audio, sr=sr)))
+                    emphasis_score = (peak_rms * 0.6) + ((spectral_centroid / 4000.0) * 0.4)
                 else:
-                    # Caem da mediana (400) até o piso do bloco (300)
-                    floorroom = max(median_db - min_db, 1.5)
-                    ratio = np.clip((median_db - w_db) / floorroom, 0.0, 1.0)
-                    raw_weight = 400.0 - (ratio * 100.0)
-                    weight = int(round(raw_weight / 50.0) * 50)
+                    emphasis_score = 0.5
 
-                weight = int(np.clip(weight, 300, 800))
+                # Classificação do tipo da palavra e mapeamento de espessura
+                if volume_percent < 25 and emphasis_score < 0.3:
+                    word_type = "whisper"
+                    weight = 200
+                elif volume_percent > 75 and emphasis_score > 0.8:
+                    word_type = "shout"
+                    weight = 900
+                else:
+                    word_type = "normal"
+                    raw_w = 300 + (emphasis_score * 500)
+                    weight = int(round(raw_w / 100.0) * 100)
+                    weight = int(np.clip(weight, 300, 800))
 
                 words_data.append(
                     {
@@ -205,6 +187,7 @@ def process_video_to_json(
                         "end": item["end"],
                         "weight": weight,
                         "volumePercent": volume_percent,
+                        "type": word_type,
                         "width": 78,
                         "italic": False,
                     }
