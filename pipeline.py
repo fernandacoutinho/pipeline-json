@@ -1,8 +1,22 @@
+import os
+import sys
+import warnings
+import logging
 import argparse
 import json
-import os
 import subprocess
 from datetime import datetime, timezone
+from contextlib import redirect_stdout, redirect_stderr
+
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+logging.disable(logging.CRITICAL)
+
+logging.getLogger("lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
+logging.getLogger("pyannote").setLevel(logging.ERROR)
+logging.getLogger("whisperx").setLevel(logging.ERROR)
+
 import librosa
 import numpy as np
 import torch
@@ -10,25 +24,23 @@ import whisperx
 
 SPEAKER_COLORS = ["#6B8AFF", "#F5A623", "#4CAF50", "#E91E63", "#9C27B0", "#00BCD4"]
 
+
 def extract_audio_from_video(video_path: str, audio_output_path: str):
     command = [
         "ffmpeg",
         "-y",
-        "-i",
-        video_path,
+        "-i", video_path,
         "-vn",
-        "-acodec",
-        "pcm_s16le",
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
+        "-af", "highpass=f=80,lowpass=f=8000,loudnorm",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
         audio_output_path,
     ]
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
+# classifica o tipo de bloco de áudio com base em características acústicas
 def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
-    """Classifica o bloco entre 'dialogue', 'music' e 'sfx'."""
     if len(block_audio) == 0:
         return "dialogue"
 
@@ -37,44 +49,49 @@ def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
         return "dialogue"
 
     flatness = float(np.mean(librosa.feature.spectral_flatness(y=block_audio)))
-    zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=block_audio)))
 
     y_harmonic = librosa.effects.harmonic(block_audio)
     harmonic_energy = float(np.mean(y_harmonic**2))
     harmonic_ratio = harmonic_energy / (total_energy + 1e-6)
 
-    if flatness > 0.25 or zcr > 0.22:
+    if flatness > 0.45:
         return "sfx"
-    elif harmonic_ratio > 0.70 and flatness < 0.06:
+    elif harmonic_ratio > 0.75 and flatness < 0.05:
         return "music"
     else:
         return "dialogue"
 
+# calcula o nível de volume de uma palavra com base no áudio da palavra
 def get_word_db(word_audio: np.ndarray) -> float:
-    """Calcula o nível de energia em dB da palavra."""
-    if len(word_audio) == 0:
+    if len(word_audio) < 64:
         return -60.0
 
     frame_length = min(len(word_audio), 256)
-    if frame_length < 64:
-        rms = float(np.sqrt(np.mean(word_audio**2)))
-    else:
-        rms_frames = librosa.feature.rms(y=word_audio, frame_length=frame_length, hop_length=64)[0]
+    try:
+        rms_frames = librosa.feature.rms(
+            y=word_audio, frame_length=frame_length, hop_length=64
+        )[0]
         rms = float(np.percentile(rms_frames, 80))
+    except Exception:
+        rms = float(np.sqrt(np.mean(word_audio**2)))
 
-    return 20 * np.log10(max(rms, 1e-6))
+    if np.isnan(rms) or rms <= 0:
+        return -60.0
+
+    return float(20 * np.log10(max(rms, 1e-6)))
+
 
 def process_video_to_json(
     video_path: str,
     output_json_path: str,
-    language: str = "pt",
+    language: str = None,
     model_size: str = "small",
 ):
     temp_audio = "temp_extracted_audio.wav"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
-        # 1. Extração de áudio
+        # 1. Extração de áudio limpo
         extract_audio_from_video(video_path, temp_audio)
 
         # 2. Leitura e normalização do áudio completo
@@ -90,84 +107,87 @@ def process_video_to_json(
         db_speech = 20 * np.log10(np.maximum(active_rms, 1e-6))
         global_mean_db = float(np.median(db_speech)) if len(db_speech) > 0 else -20.0
 
-        # 3. Transcrição e alinhamento
-        whisper_model = whisperx.load_model(
-            model_size, device, compute_type="float32", language=language
-        )
-        audio_data = whisperx.load_audio(temp_audio)
-        result = whisper_model.transcribe(audio_data, batch_size=16)
+        # 3. Transcrição com detecção automática de idioma
+        vad_options = {
+            "vad_onset": 0.20,
+            "vad_offset": 0.15
+        }
 
-        align_model, metadata = whisperx.load_align_model(
-            language_code=result["language"], device=device
-        )
-        aligned_result = whisperx.align(
-            result["segments"],
-            align_model,
-            metadata,
-            audio_data,
-            device,
-            return_char_alignments=False,
-        )
+        with open(os.devnull, 'w') as fnull, redirect_stdout(fnull), redirect_stderr(fnull):
+            whisper_model = whisperx.load_model(
+                model_size,
+                device,
+                compute_type="float32",
+                language=language,
+                vad_options=vad_options
+            )
+            audio_data = whisperx.load_audio(temp_audio)
+            result = whisper_model.transcribe(audio_data, batch_size=16)
+
+            detected_language = result["language"]
+
+            align_model, metadata = whisperx.load_align_model(
+                language_code=detected_language, device=device
+            )
+            aligned_result = whisperx.align(
+                result["segments"],
+                align_model,
+                metadata,
+                audio_data,
+                device,
+                return_char_alignments=False,
+            )
 
         captions = []
         mapped_speaker_id = "S0"
 
-        # 4. Processamento dos blocos com separação de volume e energia de pronúncia
+        # 4. Processamento mantendo tempos do WhisperX
         for seg_idx, segment in enumerate(aligned_result["segments"]):
             words = segment.get("words", [])
-            if not words:
+            valid_words = [w for w in words if "start" in w and "end" in w]
+            if not valid_words:
                 continue
 
-            block_start = round(words[0]["start"], 2)
-            block_end = round(words[-1]["end"], 2)
+            block_start = round(float(valid_words[0]["start"]), 2)
+            block_end = round(float(valid_words[-1]["end"]), 2)
 
-            start_sample_block = int(block_start * sr)
-            end_sample_block = int(block_end * sr)
+            start_sample_block = max(0, int(block_start * sr))
+            end_sample_block = min(len(y), int(block_end * sr))
             block_audio = y[start_sample_block:end_sample_block]
 
             block_type = classify_block_type(block_audio, sr)
 
-            block_words_info = []
-            for w in words:
-                if "start" not in w or "end" not in w:
-                    continue
-                w_start = round(w["start"], 2)
-                w_end = round(w["end"], 2)
-
-                start_sample_word = int(w_start * sr)
-                end_sample_word = int(w_end * sr)
-                word_audio = y[start_sample_word:end_sample_word]
-
-                w_db = get_word_db(word_audio)
-                block_words_info.append({
-                    "word": w["word"].strip(),
-                    "start": w_start,
-                    "end": w_end,
-                    "db": w_db,
-                    "audio": word_audio,
-                })
-
-            if not block_words_info:
-                continue
-
             words_data = []
-            for item in block_words_info:
-                w_db = item["db"]
-                word_audio = item["audio"]
+            for w in valid_words:
+                w_start = float(w["start"])
+                w_end = float(w["end"])
 
-                # A. Volume relativo da palavra (volume_percent)
+                start_sample_word = max(0, int(w_start * sr))
+                end_sample_word = min(len(y), int(w_end * sr))
+
+                if end_sample_word - start_sample_word < 512:
+                    end_sample_word = min(len(y), start_sample_word + 512)
+
+                word_audio = y[start_sample_word:end_sample_word]
+                w_db = get_word_db(word_audio)
+
                 db_diff = w_db - global_mean_db
                 volume_percent = int(np.clip(50 + (db_diff * 3.5), 10, 100))
 
-                # B. Energia (espessura) da palavra (emphasis_score)
-                if len(word_audio) > 0:
+                if len(word_audio) >= 256:
                     peak_rms = float(np.max(np.abs(word_audio)))
-                    spectral_centroid = float(np.mean(librosa.feature.spectral_centroid(y=word_audio, sr=sr)))
+                    try:
+                        sc = librosa.feature.spectral_centroid(y=word_audio, sr=sr)
+                        spectral_centroid = float(np.nanmean(sc))
+                        if np.isnan(spectral_centroid):
+                            spectral_centroid = 2000.0
+                    except Exception:
+                        spectral_centroid = 2000.0
+
                     emphasis_score = (peak_rms * 0.6) + ((spectral_centroid / 4000.0) * 0.4)
                 else:
                     emphasis_score = 0.5
 
-                # Classificação do tipo da palavra e mapeamento de espessura
                 if volume_percent < 25 and emphasis_score < 0.3:
                     word_type = "whisper"
                     weight = 200
@@ -182,9 +202,9 @@ def process_video_to_json(
 
                 words_data.append(
                     {
-                        "text": item["word"],
-                        "start": item["start"],
-                        "end": item["end"],
+                        "text": w["word"].strip(),
+                        "start": round(w_start, 2),
+                        "end": round(w_end, 2),
                         "weight": weight,
                         "volumePercent": volume_percent,
                         "type": word_type,
@@ -204,7 +224,6 @@ def process_video_to_json(
                 }
             )
 
-        # 5. Elenco
         cast = [
             {
                 "id": "S0",
@@ -213,13 +232,12 @@ def process_video_to_json(
             }
         ]
 
-        # 6. JSON Final
         final_json = {
             "$schema": "https://opencaptions.tools/schema/cwi/1.0.json",
             "version": "1.0",
             "metadata": {
                 "duration": round(total_duration, 1),
-                "language": language,
+                "language": detected_language,  # Armazena o idioma detectado no JSON
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "generator": "opencaptions/0.1.0",
                 "extractor_backend": "audio-vision-v1",
@@ -235,6 +253,7 @@ def process_video_to_json(
         if os.path.exists(temp_audio):
             os.remove(temp_audio)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Gera legendas JSON OpenCaptions CWI 1.0 a partir de vídeo."
@@ -243,7 +262,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", default="legendas.json", help="Caminho do JSON de saída"
     )
-    parser.add_argument("--lang", default="pt", help="Código do idioma (ex: pt, en)")
+    parser.add_argument(
+        "--lang", default=None, help="Código do idioma (ex: pt, en). Se omitido, detecta automaticamente."
+    )
 
     args = parser.parse_args()
     process_video_to_json(args.video, args.output, language=args.lang)
