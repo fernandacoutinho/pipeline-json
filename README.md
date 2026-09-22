@@ -75,9 +75,20 @@ Em seguida, instale as bibliotecas de processamento:
 
 ```bash
 pip install git+[https://github.com/m-bain/whisperX.git](https://github.com/m-bain/whisperX.git)
-pip install librosa numpy
+pip install librosa numpy python-dotenv
 ```
+## Configuração da Diarização
 
+Para permitir a identificação de falantes, configure o token de acesso:
+
+1. Aceite os termos nos 3 repositórios do Hugging Face:
+   - [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+2. Crie um token do tipo **Read** em [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+3. Crie um arquivo `.env` na raiz do projeto com o conteúdo:
+   ```env
+   HF_TOKEN=hf_seu_token_aqui
 ---
 
 ## Instruções de Uso
@@ -104,7 +115,10 @@ python main.py --video caminho/do/video.mp4 --output resultado.json --lang pt
 | :--- | :---: | :---: | :---: | :--- |
 | `--video` | String | **Sim** | — | Caminho do arquivo de vídeo de entrada. |
 | `--output` | String | Não | `legendas.json` | Caminho do arquivo JSON de saída. |
-| `--lang` | String | Não | `None` | Código ISO do idioma (ex: `pt`, `en`). Quando omitido, o idioma é detectado automaticamente. |
+| `--lang` | String | Não | `None` | Código ISO do idioma (ex: `pt`, `en`). |
+| `--hf_token` | String | Não | `None` | Token do Hugging Face (sobrescreve o `.env`). |
+| `--min_speakers` | Integer | Não | `None` | Número mínimo de falantes esperados. |
+| `--max_speakers` | Integer | Não | `None` | Número máximo de falantes esperados. |
 
 ---
 
