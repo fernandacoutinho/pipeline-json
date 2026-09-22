@@ -149,10 +149,22 @@ def process_video_to_json(
 
             # 4. Diarização
             if hf_token:
-                diarize_model = whisperx.DiarizationPipeline(
-                    use_auth_token=hf_token, 
-                    device=device
-                )
+                try:
+                    from whisperx.diarize import DiarizationPipeline
+                except ImportError:
+                    from whisperx import DiarizationPipeline
+
+                try:
+                    diarize_model = DiarizationPipeline(
+                        token=hf_token, 
+                        device=device
+                    )
+                except TypeError:
+                    diarize_model = DiarizationPipeline(
+                        use_auth_token=hf_token, 
+                        device=device
+                    )
+
                 diarize_segments = diarize_model(
                     audio_data, 
                     min_speakers=min_speakers, 
