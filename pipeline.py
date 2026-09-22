@@ -8,6 +8,9 @@ import subprocess
 from datetime import datetime, timezone
 from contextlib import redirect_stdout, redirect_stderr
 
+from dotenv import load_dotenv
+load_dotenv()
+
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 logging.disable(logging.CRITICAL)
@@ -39,7 +42,7 @@ def extract_audio_from_video(video_path: str, audio_output_path: str):
     ]
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-# classifica o tipo de bloco de áudio com base em características acústicas
+
 def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
     if len(block_audio) == 0:
         return "dialogue"
@@ -61,7 +64,7 @@ def classify_block_type(block_audio: np.ndarray, sr: int) -> str:
     else:
         return "dialogue"
 
-# calcula o nível de volume de uma palavra com base no áudio da palavra
+
 def get_word_db(word_audio: np.ndarray) -> float:
     if len(word_audio) < 64:
         return -60.0
@@ -86,7 +89,13 @@ def process_video_to_json(
     output_json_path: str,
     language: str = None,
     model_size: str = "small",
+    hf_token: str = None,
+    min_speakers: int = None,
+    max_speakers: int = None,
 ):
+    # Se o token não for passado por parâmetro na função, busca do arquivo .env
+    hf_token = hf_token or os.getenv("HF_TOKEN")
+
     temp_audio = "temp_extracted_audio.wav"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -107,7 +116,7 @@ def process_video_to_json(
         db_speech = 20 * np.log10(np.maximum(active_rms, 1e-6))
         global_mean_db = float(np.median(db_speech)) if len(db_speech) > 0 else -20.0
 
-        # 3. Transcrição com detecção automática de idioma
+        # 3. Transcrição e Alinhamento
         vad_options = {
             "vad_onset": 0.20,
             "vad_offset": 0.15
@@ -138,15 +147,38 @@ def process_video_to_json(
                 return_char_alignments=False,
             )
 
-        captions = []
-        mapped_speaker_id = "S0"
+            # 4. Diarização
+            if hf_token:
+                diarize_model = whisperx.DiarizationPipeline(
+                    use_auth_token=hf_token, 
+                    device=device
+                )
+                diarize_segments = diarize_model(
+                    audio_data, 
+                    min_speakers=min_speakers, 
+                    max_speakers=max_speakers
+                )
+                aligned_result = whisperx.assign_word_speakers(diarize_segments, aligned_result)
 
-        # 4. Processamento mantendo tempos do WhisperX
+        captions = []
+        speaker_map = {}
+
+        def get_mapped_speaker_id(raw_speaker: str) -> str:
+            if not raw_speaker:
+                raw_speaker = "SPEAKER_00"
+            if raw_speaker not in speaker_map:
+                speaker_map[raw_speaker] = f"S{len(speaker_map)}"
+            return speaker_map[raw_speaker]
+
+        # 5. Processamento mantendo tempos e falantes
         for seg_idx, segment in enumerate(aligned_result["segments"]):
             words = segment.get("words", [])
             valid_words = [w for w in words if "start" in w and "end" in w]
             if not valid_words:
                 continue
+
+            raw_speaker = segment.get("speaker", "SPEAKER_00")
+            mapped_speaker_id = get_mapped_speaker_id(raw_speaker)
 
             block_start = round(float(valid_words[0]["start"]), 2)
             block_end = round(float(valid_words[-1]["end"]), 2)
@@ -224,20 +256,26 @@ def process_video_to_json(
                 }
             )
 
-        cast = [
-            {
-                "id": "S0",
-                "name": "Speaker 0",
-                "color": SPEAKER_COLORS[0],
-            }
-        ]
+        # Monta a lista de falantes para o JSON
+        cast = []
+        for raw_spk, mapped_id in speaker_map.items():
+            spk_index = int(mapped_id.replace("S", ""))
+            color = SPEAKER_COLORS[spk_index % len(SPEAKER_COLORS)]
+            cast.append({
+                "id": mapped_id,
+                "name": f"Speaker {spk_index}",
+                "color": color
+            })
+
+        if not cast:
+            cast = [{"id": "S0", "name": "Speaker 0", "color": SPEAKER_COLORS[0]}]
 
         final_json = {
             "$schema": "https://opencaptions.tools/schema/cwi/1.0.json",
             "version": "1.0",
             "metadata": {
                 "duration": round(total_duration, 1),
-                "language": detected_language,  # Armazena o idioma detectado no JSON
+                "language": detected_language,
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "generator": "opencaptions/0.1.0",
                 "extractor_backend": "audio-vision-v1",
@@ -265,6 +303,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lang", default=None, help="Código do idioma (ex: pt, en). Se omitido, detecta automaticamente."
     )
+    parser.add_argument(
+        "--hf_token", default=None, help="Token do Hugging Face (Sobrescreve a variável do .env)"
+    )
+    parser.add_argument(
+        "--min_speakers", type=int, default=None, help="Número mínimo de falantes para diarização."
+    )
+    parser.add_argument(
+        "--max_speakers", type=int, default=None, help="Número máximo de falantes para diarização."
+    )
 
     args = parser.parse_args()
-    process_video_to_json(args.video, args.output, language=args.lang)
+    process_video_to_json(
+        args.video, 
+        args.output, 
+        language=args.lang,
+        hf_token=args.hf_token,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers
+    )
